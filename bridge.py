@@ -40,6 +40,13 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 from playwright.sync_api import Error as PlaywrightError
+from contextlib import contextmanager
+
+try:  # optional stealth engine: CloakBrowser (source-level fingerprint patches)
+    import cloakbrowser as _cloak
+except Exception:
+    _cloak = None
+ENGINE = os.environ.get("PRISM_ENGINE", "cloak" if _cloak is not None else "playwright").strip().lower()
 
 HOST = os.environ.get("PRISM_HOST") or "127.0.0.1"
 PORT = int(os.environ.get("PRISM_PORT") or "18765")
@@ -1711,6 +1718,63 @@ def human_pacing_wait() -> None:
         time.sleep(wait)
 
 
+# --- engine swap: CloakBrowser when available -------------------------------------
+# Vanilla headless Playwright is a bot-signature parade; CloakBrowser is the stealth
+# Chromium the key-harvesting stack already runs against Turnstile (humanize=True,
+# geoip together with a proxy, per-install stable fingerprint seed). PRISM_ENGINE
+# forces the original engine, PRISM_PROXY=http://host:port routes the profile.
+CLOAK_HEADLESS = os.environ.get("PRISM_HEADLESS", "true").lower() != "false"
+CLOAK_PROXY = os.environ.get("PRISM_PROXY") or None
+
+
+def _cloak_seed() -> int:
+    seed_file = PROFILE_DIR.parent / "cloak-fingerprint-seed"
+    try:
+        return int(seed_file.read_text().strip())
+    except Exception:
+        seed = random.randint(10 ** 8, 10 ** 9 - 1)
+        try:
+            seed_file.parent.mkdir(parents=True, exist_ok=True)
+            seed_file.write_text(str(seed))
+        except Exception:
+            pass
+        return seed
+
+
+@contextmanager
+def _persistent_context(headless: bool):
+    """Serve/login both get their browser context here: CloakBrowser when importable
+    (stealth + humanized input), the original Playwright otherwise."""
+    common = ["--no-first-run", "--no-default-browser-check"]
+    if ENGINE == "cloak" and _cloak is not None:
+        platform = "macintosh" if sys.platform == "darwin" else ("windows" if sys.platform.startswith("win") else "linux")
+        context = _cloak.launch_persistent_context(
+            str(PROFILE_DIR),
+            headless=headless,
+            humanize=True,
+            geoip=bool(CLOAK_PROXY),
+            proxy=CLOAK_PROXY,
+            args=common + [f"--fingerprint={_cloak_seed()}", f"--fingerprint-platform={platform}"],
+        )
+        try:
+            yield context
+        finally:
+            context.close()
+        return
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE_DIR),
+            headless=headless,
+            user_agent=USER_AGENT,
+            args=common + ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+            **({"channel": BROWSER_CHANNEL} if BROWSER_CHANNEL else {}),
+        )
+        try:
+            yield context
+        finally:
+            context.close()
+
+
 class PrismPage:
     def __init__(self) -> None:
         self.page = None
@@ -2315,21 +2379,8 @@ class Worker:
                 # run can hold an anonymous Prism session that shadows the injected cookies.
                 shutil.rmtree(PROFILE_DIR, ignore_errors=True)
             PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-            print("[init] 正在启动 Chromium 浏览器...", flush=True)
-            with sync_playwright() as p:
-                context = p.chromium.launch_persistent_context(
-                    user_data_dir=str(PROFILE_DIR),
-                    headless=True,
-                    user_agent=USER_AGENT,
-                    args=[
-                        "--no-first-run",
-                        "--no-default-browser-check",
-                        "--no-sandbox",
-                        "--disable-setuid-sandbox",
-                        "--disable-dev-shm-usage",
-                    ],
-                    **({"channel": BROWSER_CHANNEL} if BROWSER_CHANNEL else {}),
-                )
+            print(f"[init] 正在启动浏览器（engine={ENGINE}）...", flush=True)
+            with _persistent_context(headless=CLOAK_HEADLESS) as context:
                 # auth.json is only written at login; never let it overwrite a newer token in the profile.
                 profile_cookie = context_cookie_header(context)
                 if token_expiry(profile_cookie) > token_expiry(cookie):
@@ -3064,12 +3115,7 @@ def cmd_login() -> None:
     print(f"本地 Profile 路径: {PROFILE_DIR}")
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            headless=False,
-            args=["--no-first-run", "--no-default-browser-check"],
-        )
+    with _persistent_context(headless=False) as context:
 
         # Only a still-valid session is worth re-injecting; an expired token must not pass as a login.
         existing_cookie = load_cookie()
