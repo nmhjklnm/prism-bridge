@@ -20,6 +20,7 @@ import ipaddress
 import json
 import os
 import queue
+import random
 import re
 import shutil
 import socket
@@ -31,6 +32,7 @@ import urllib.request
 import uuid
 
 
+from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1661,6 +1663,54 @@ class PrismTooLarge(PrismTurnError):
     """Prism refused the turn for its size ("conversation_too_large"). Nothing was generated."""
 
 
+# --- human pacing -----------------------------------------------------------------
+# Prism 403s machine-cadence submissions (5 starts in ~25s observed upstream);
+# the throttle reads like a rolling behavioural score, so space turns out the
+# way a person would instead of only backing off after the refusal.
+PACING_MIN = float(os.environ.get("PRISM_PACING_MIN", "2.5"))
+PACING_MAX = float(os.environ.get("PRISM_PACING_MAX", "6.0"))
+PACING_PAUSE_CHANCE = float(os.environ.get("PRISM_PACING_PAUSE_CHANCE", "0.12"))
+PACING_PAUSE_MIN = float(os.environ.get("PRISM_PACING_PAUSE_MIN", "9.0"))
+PACING_PAUSE_MAX = float(os.environ.get("PRISM_PACING_PAUSE_MAX", "18.0"))
+PACING_BUDGET = int(os.environ.get("PRISM_PACING_BUDGET", "4"))  # max starts per window; 0 disables
+PACING_WINDOW = float(os.environ.get("PRISM_PACING_WINDOW", "30"))
+
+_pacing_lock = threading.Lock()
+_pacing_starts: deque = deque()
+
+
+def _human_gap() -> float:
+    gap = random.uniform(PACING_MIN, PACING_MAX)
+    if random.random() < PACING_PAUSE_CHANCE:
+        # occasionally a person re-reads before sending the next message
+        gap += random.uniform(PACING_PAUSE_MIN, PACING_PAUSE_MAX)
+    return gap
+
+
+def human_pacing_wait() -> None:
+    """Block until the next Prism turn may be submitted: a human-sized gap after the
+    previous submission, plus a rolling budget so a burst cannot trip the 403 throttle."""
+    if PACING_BUDGET <= 0:
+        return
+    while True:
+        with _pacing_lock:
+            now = time.time()
+            while _pacing_starts and now - _pacing_starts[0] > PACING_WINDOW:
+                _pacing_starts.popleft()
+            if len(_pacing_starts) >= PACING_BUDGET:
+                wait = _pacing_starts[0] + PACING_WINDOW - now + random.uniform(0.5, 2.0)
+            elif _pacing_starts:
+                gap = _human_gap() - (now - _pacing_starts[-1])
+                wait = gap if gap > 0 else 0.0
+            else:
+                wait = 0.0
+            if wait <= 0:
+                _pacing_starts.append(now)
+                return
+        print(f"[pacing] sleeping {wait:.1f}s before the next Prism turn", flush=True)
+        time.sleep(wait)
+
+
 class PrismPage:
     def __init__(self) -> None:
         self.page = None
@@ -1938,6 +1988,7 @@ class PrismPage:
             if not self.cookie:
                 raise RuntimeError("sandbox not ready: no cookie")
             self.boot(self.cookie)
+        human_pacing_wait()
         waited, delay = 0, 20
         reloaded = rebooted = False
         while True:
@@ -2121,7 +2172,7 @@ class PrismPage:
         deadline = time.time() + TURN_TIMEOUT_SEC
         poll_errors = 0
         while time.time() < deadline:
-            time.sleep(1.5)
+            time.sleep(random.uniform(1.2, 1.9))
             try:
                 st = self.fetch(
                     "POST",
@@ -2239,7 +2290,7 @@ class PrismPage:
             cid, prev, snapshot = result["cid"], result["rid"], result.get("snapshot")
             done += 1
             print(f"[relay] part {done}/{len(pieces)} delivered", flush=True)
-            time.sleep(PART_GAP_SEC)
+            time.sleep(PART_GAP_SEC * random.uniform(0.8, 1.5))
 
 
 # ---------------------------------------------------------------------------
