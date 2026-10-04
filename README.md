@@ -250,3 +250,13 @@ QQ 交流群：`608041120`，群主即为作者。传播、转载、二次分发
 - **滚动预算**：30 秒窗口内最多 4 次提交（观测线是 25 秒 5 次，留余量），超了排队等窗口滚动
 
 状态轮询与分片间隔也加了随机抖动。全部可用环境变量调参（`PRISM_PACING_MIN/MAX`、`PRISM_PACING_PAUSE_*`、`PRISM_PACING_BUDGET=0` 关闭）。代价是持续吞吐封顶约每分钟 8 次——换来的是不喂行为分、不吃 403 冷却。
+
+## Fork 改动：令牌种子登录（免密码）
+
+Prism 的会话 cookie `prism_oai_access_token` 直接认 OpenAI OAuth 访问令牌（同构 JWT）。号池里的账号令牌用 `seed_auth.py` 一条命令写入 auth.json 即完成"登录"，无需浏览器输密码、也不存在十天手动重登——令牌刷新后重新种子一次即可：
+
+```
+python seed_auth.py <access_token> [auth.json路径]
+```
+
+实测：号池令牌种子 → CloakBrowser 引擎启动 → 自动建工作区 → 正常生成，全程零密码（2026-10-04）。
